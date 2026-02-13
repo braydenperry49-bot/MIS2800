@@ -677,7 +677,7 @@ def sentiment_valuation(data: dict, ticker: str) -> ValuationResult:
         pos_count = 0
         neg_count = 0
         for h in headlines:
-            text = (h.get("title", "") + " " + h.get("description", "")).lower()
+            text = ((h.get("title") or "") + " " + (h.get("description") or "")).lower()
             pos_count += sum(1 for w in positive_words if w in text)
             neg_count += sum(1 for w in negative_words if w in text)
         total = pos_count + neg_count
