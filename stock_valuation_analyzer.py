@@ -116,12 +116,12 @@ def fetch_yfinance_data(ticker: str) -> dict:
     except Exception:
         pass
 
-    result = {
-        "info": _serialize(info),
+    result = _serialize({
+        "info": info,
         "history": hist.reset_index().to_dict(orient="list") if not hist.empty else {},
         "financials": financials,
         "recommendations": recommendations,
-    }
+    })
     cache_set(cache_key, result)
     return result
 
@@ -129,20 +129,29 @@ def fetch_yfinance_data(ticker: str) -> dict:
 def _serialize(obj):
     """Make an object JSON-serializable."""
     if isinstance(obj, dict):
-        return {k: _serialize(v) for k, v in obj.items()}
+        return {str(k): _serialize(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_serialize(v) for v in obj]
     if isinstance(obj, (np.integer,)):
         return int(obj)
-    if isinstance(obj, (np.floating,)):
+    if isinstance(obj, (np.floating, np.float64)):
         return float(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
     if isinstance(obj, (np.ndarray,)):
-        return obj.tolist()
+        return _serialize(obj.tolist())
     if isinstance(obj, (pd.Timestamp, datetime.datetime, datetime.date)):
         return obj.isoformat()
-    if pd.isna(obj):
-        return None
-    return obj
+    if isinstance(obj, pd.Timedelta):
+        return str(obj)
+    try:
+        if pd.isna(obj):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    return str(obj)
 
 
 def fetch_fred_series(series_id: str):
