@@ -741,6 +741,91 @@ def sentiment_valuation(data: dict, ticker: str) -> ValuationResult:
     return ValuationResult("Sentiment", fair_value, confidence, details)
 
 
+# ── 3f. Seasonal Analysis ────────────────────────────────────────────────────
+
+def seasonal_valuation(data: dict) -> ValuationResult:
+    """Seasonal analysis based on historical monthly return patterns."""
+    hist_raw = data.get("history", {})
+    if not hist_raw or "Close" not in hist_raw:
+        return ValuationResult("Seasonal", 0, 0, {"error": "No price history"})
+
+    dates = hist_raw.get("Date", [])
+    closes = hist_raw.get("Close", [])
+
+    if len(closes) < 252:
+        return ValuationResult("Seasonal", 0, 0,
+                               {"error": "Need at least 1 year of history"})
+
+    # Build a DataFrame of monthly returns
+    df = pd.DataFrame({"date": pd.to_datetime(dates), "close": closes})
+    df = df.dropna(subset=["close"])
+    df = df.set_index("date").sort_index()
+    monthly = df["close"].resample("ME").last().dropna()
+    monthly_ret = monthly.pct_change().dropna()
+
+    if len(monthly_ret) < 12:
+        return ValuationResult("Seasonal", 0, 0,
+                               {"error": "Not enough monthly data"})
+
+    monthly_ret_df = pd.DataFrame({
+        "month": monthly_ret.index.month,
+        "return": monthly_ret.values,
+    })
+
+    # Average return and win-rate for each calendar month
+    month_stats = monthly_ret_df.groupby("month")["return"].agg(
+        avg_return="mean", win_rate=lambda x: (x > 0).mean(), count="count"
+    )
+
+    current_month = datetime.datetime.now().month
+    # Look-ahead window: average return over the next 3 months historically
+    forward_months = [(current_month + i - 1) % 12 + 1 for i in range(1, 4)]
+    fwd_returns = [
+        month_stats.loc[m, "avg_return"]
+        for m in forward_months
+        if m in month_stats.index
+    ]
+
+    if not fwd_returns:
+        return ValuationResult("Seasonal", 0, 0,
+                               {"error": "Seasonal data incomplete"})
+
+    expected_3m_return = sum(fwd_returns)
+
+    info = data.get("info", {})
+    current_price = info.get("currentPrice") or info.get("regularMarketPrice", 0)
+    if not current_price:
+        return ValuationResult("Seasonal", 0, 0, {"error": "No current price"})
+
+    fair_value = current_price * (1 + expected_3m_return)
+
+    # Confidence based on number of years of data
+    years_of_data = len(monthly_ret) / 12
+    confidence = min(0.3 + 0.1 * years_of_data, 0.65)
+
+    # Build month-name stats for details
+    month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    monthly_detail = {}
+    for m in range(1, 13):
+        if m in month_stats.index:
+            monthly_detail[month_names[m - 1]] = {
+                "avg_return": round(month_stats.loc[m, "avg_return"], 4),
+                "win_rate": round(month_stats.loc[m, "win_rate"], 4),
+                "samples": int(month_stats.loc[m, "count"]),
+            }
+
+    details = {
+        "current_price": current_price,
+        "expected_3m_return": round(expected_3m_return, 4),
+        "forward_months": [month_names[m - 1] for m in forward_months],
+        "monthly_stats": monthly_detail,
+        "years_of_data": round(years_of_data, 1),
+    }
+
+    return ValuationResult("Seasonal", fair_value, confidence, details)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 4 — Composite Valuation
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -753,6 +838,7 @@ def composite_valuation(results: list, weights: dict) -> dict:
         "Analyst Targets": "analyst",
         "Technical": "technical",
         "Sentiment": "sentiment",
+        "Seasonal": "seasonal",
     }
 
     weighted_sum = 0.0
@@ -1039,8 +1125,77 @@ def generate_excel_report(ticker: str, data: dict, results: list,
             ws3.cell(row=proj_row + 1 + i, column=2,
                      value=_fmt_number(fcf, "large_currency"))
 
+        # DCF Sensitivity Matrix (WACC vs Terminal Growth Rate)
+        sens_row = proj_row + len(proj_fcfs) + 3
+        ws3.cell(row=sens_row, column=1,
+                 value="Sensitivity Analysis — Fair Value per Share").font = Font(bold=True)
+        sens_row += 1
+
+        wacc_base = d.get("wacc", 0.10)
+        tgr_base = cfg.DCF_DEFAULTS["terminal_growth_rate"]
+        wacc_steps = cfg.DCF_SENSITIVITY["wacc_steps"]
+        tgr_steps = cfg.DCF_SENSITIVITY["tgr_steps"]
+
+        # Column headers (TGR values)
+        ws3.cell(row=sens_row, column=1, value="WACC \\ TGR")
+        for j, tgr_off in enumerate(tgr_steps):
+            tgr_val = tgr_base + tgr_off
+            ws3.cell(row=sens_row, column=2 + j,
+                     value=f"{tgr_val:.1%}")
+        _style_header(ws3, sens_row, 1 + len(tgr_steps))
+
+        shares = d.get("shares_outstanding", 1)
+        cash = data.get("info", {}).get("totalCash", 0) or 0
+        total_debt = data.get("info", {}).get("totalDebt", 0) or 0
+
+        good_fill = PatternFill(start_color=cfg.COLOR_SCHEME["good_bg"],
+                                end_color=cfg.COLOR_SCHEME["good_bg"],
+                                fill_type="solid")
+        bad_fill = PatternFill(start_color=cfg.COLOR_SCHEME["bad_bg"],
+                               end_color=cfg.COLOR_SCHEME["bad_bg"],
+                               fill_type="solid")
+        warn_fill_bg = PatternFill(start_color=cfg.COLOR_SCHEME["warn_bg"],
+                                   end_color=cfg.COLOR_SCHEME["warn_bg"],
+                                   fill_type="solid")
+
+        for i, wacc_off in enumerate(wacc_steps):
+            r = sens_row + 1 + i
+            w = wacc_base + wacc_off
+            ws3.cell(row=r, column=1, value=f"{w:.2%}").font = Font(bold=True)
+            for j, tgr_off in enumerate(tgr_steps):
+                tg = tgr_base + tgr_off
+                if w > tg:
+                    # Recompute terminal value & fair value
+                    t_fcf = proj_fcfs[-1] * (1 + tg) if proj_fcfs else 0
+                    tv = t_fcf / (w - tg)
+                    pv_t = tv / ((1 + w) ** len(proj_fcfs))
+                    pv_f = sum(f / ((1 + w) ** yr)
+                               for yr, f in enumerate(proj_fcfs, 1))
+                    ev = pv_f + pv_t
+                    eq = ev + cash - total_debt
+                    fv = eq / shares if shares > 0 else 0
+                else:
+                    fv = 0  # invalid when WACC <= TGR
+
+                cell = ws3.cell(row=r, column=2 + j,
+                                value=_fmt_number(fv, "currency"))
+                # Color code relative to current price
+                current_price_val = data.get("info", {}).get(
+                    "currentPrice") or data.get("info", {}).get(
+                    "regularMarketPrice", 0)
+                if current_price_val and fv > 0:
+                    pct = (fv - current_price_val) / current_price_val
+                    if pct > 0.15:
+                        cell.fill = good_fill
+                    elif pct < -0.15:
+                        cell.fill = bad_fill
+                    else:
+                        cell.fill = warn_fill_bg
+
         ws3.column_dimensions["A"].width = 28
-        ws3.column_dimensions["B"].width = 20
+        ws3.column_dimensions["B"].width = 14
+        for j in range(len(tgr_steps)):
+            ws3.column_dimensions[get_column_letter(3 + j)].width = 14
     else:
         ws3["A1"].value = "DCF Analysis — Insufficient Data"
         ws3["A1"].font = Font(size=14, bold=True, color=cfg.COLOR_SCHEME["negative"])
@@ -1131,7 +1286,164 @@ def generate_excel_report(ticker: str, data: dict, results: list,
     ws5.column_dimensions["A"].width = 28
     ws5.column_dimensions["B"].width = 16
 
-    # ── Sheet 6: Company Profile ──
+    # ── Sheet 6: Financial Ratios ──
+    ws_ratios = wb.create_sheet("Financial Ratios")
+    ws_ratios.sheet_properties.tabColor = "00B0F0"
+
+    ws_ratios["A1"].value = "Financial Ratio Analysis"
+    ws_ratios["A1"].font = Font(size=14, bold=True, color=cfg.COLOR_SCHEME["header_bg"])
+
+    row = 3
+    headers = ["Ratio", "Value", "Benchmark", "Status"]
+    for c, h in enumerate(headers, 1):
+        ws_ratios.cell(row=row, column=c, value=h)
+    _style_header(ws_ratios, row, len(headers))
+
+    good_fill = PatternFill(start_color=cfg.COLOR_SCHEME["good_bg"],
+                            end_color=cfg.COLOR_SCHEME["good_bg"], fill_type="solid")
+    warn_fill_r = PatternFill(start_color=cfg.COLOR_SCHEME["warn_bg"],
+                              end_color=cfg.COLOR_SCHEME["warn_bg"], fill_type="solid")
+    bad_fill_r = PatternFill(start_color=cfg.COLOR_SCHEME["bad_bg"],
+                             end_color=cfg.COLOR_SCHEME["bad_bg"], fill_type="solid")
+
+    # Map config ratio names to yfinance info keys
+    ratio_keys = {
+        "Current Ratio": "currentRatio",
+        "Quick Ratio": "quickRatio",
+        "Gross Margin": "grossMargins",
+        "Operating Margin": "operatingMargins",
+        "Net Margin": "profitMargins",
+        "ROE": "returnOnEquity",
+        "ROA": "returnOnAssets",
+        "Debt / Equity": "debtToEquity",
+        "PEG Ratio": "pegRatio",
+    }
+
+    ratio_row = row
+    for ratio_name, bench in cfg.RATIO_BENCHMARKS.items():
+        info_key = ratio_keys.get(ratio_name)
+        if not info_key:
+            continue
+        raw_val = info.get(info_key)
+        if raw_val is None:
+            continue
+
+        ratio_row += 1
+        val = float(raw_val)
+        # debtToEquity from yfinance is already a ratio (e.g. 1.5 = 150%)
+        if info_key == "debtToEquity":
+            val = val / 100.0 if val > 10 else val  # yfinance sometimes returns as %
+
+        ws_ratios.cell(row=ratio_row, column=1, value=ratio_name)
+
+        # Format value
+        if ratio_name in ("Current Ratio", "Quick Ratio", "Cash Ratio",
+                          "Debt / Equity", "Debt / Assets", "PEG Ratio",
+                          "Asset Turnover", "Interest Coverage"):
+            ws_ratios.cell(row=ratio_row, column=2, value=_fmt_number(val, "ratio"))
+        else:
+            ws_ratios.cell(row=ratio_row, column=2, value=_fmt_number(val, "percent"))
+
+        # Determine status based on benchmark type
+        if "good_below" in bench:
+            # Lower is better
+            bench_str = f"< {bench['good_below']}"
+            if val <= bench["good_below"]:
+                status = "Good"
+                fill = good_fill
+            elif val >= bench["warn_above"]:
+                status = "Concern"
+                fill = bad_fill_r
+            else:
+                status = "Watch"
+                fill = warn_fill_r
+        else:
+            # Higher is better
+            bench_str = f"> {bench['good']}"
+            if val >= bench["good"]:
+                status = "Good"
+                fill = good_fill
+            elif val <= bench["warn"]:
+                status = "Concern"
+                fill = bad_fill_r
+            else:
+                status = "Watch"
+                fill = warn_fill_r
+
+        ws_ratios.cell(row=ratio_row, column=3, value=bench_str)
+        status_cell = ws_ratios.cell(row=ratio_row, column=4, value=status)
+        for c in range(1, 5):
+            ws_ratios.cell(row=ratio_row, column=c).fill = fill
+
+    ws_ratios.column_dimensions["A"].width = 22
+    ws_ratios.column_dimensions["B"].width = 14
+    ws_ratios.column_dimensions["C"].width = 14
+    ws_ratios.column_dimensions["D"].width = 12
+
+    # ── Sheet 7: Seasonal Analysis ──
+    seasonal_result = next((r for r in results if r.method == "Seasonal"), None)
+    ws_seas = wb.create_sheet("Seasonal Analysis")
+    ws_seas.sheet_properties.tabColor = "92D050"
+
+    if seasonal_result and seasonal_result.fair_value > 0:
+        sd = seasonal_result.details
+        ws_seas["A1"].value = "Seasonal Return Patterns"
+        ws_seas["A1"].font = Font(size=14, bold=True,
+                                  color=cfg.COLOR_SCHEME["header_bg"])
+
+        row = 3
+        headers = ["Month", "Avg Return", "Win Rate", "Samples"]
+        for c, h in enumerate(headers, 1):
+            ws_seas.cell(row=row, column=c, value=h)
+        _style_header(ws_seas, row, len(headers))
+
+        monthly_stats = sd.get("monthly_stats", {})
+        for i, (month, stats) in enumerate(monthly_stats.items()):
+            r = row + 1 + i
+            ws_seas.cell(row=r, column=1, value=month)
+            avg_ret = stats["avg_return"]
+            ws_seas.cell(row=r, column=2, value=_fmt_number(avg_ret, "percent"))
+            ws_seas.cell(row=r, column=3, value=_fmt_number(stats["win_rate"], "percent"))
+            ws_seas.cell(row=r, column=4, value=stats["samples"])
+            # Color code the return
+            ret_cell = ws_seas.cell(row=r, column=2)
+            if avg_ret > 0:
+                ret_cell.font = pos_font
+            elif avg_ret < 0:
+                ret_cell.font = neg_font
+            if i % 2 == 0:
+                for c in range(1, 5):
+                    ws_seas.cell(row=r, column=c).fill = alt_fill
+
+        # Summary
+        summary_row = row + len(monthly_stats) + 2
+        ws_seas.cell(row=summary_row, column=1,
+                     value="Forward 3-Month Outlook").font = Font(bold=True)
+        ws_seas.cell(row=summary_row + 1, column=1, value="Forward Months")
+        ws_seas.cell(row=summary_row + 1, column=2,
+                     value=", ".join(sd.get("forward_months", [])))
+        ws_seas.cell(row=summary_row + 2, column=1, value="Expected 3M Return")
+        ws_seas.cell(row=summary_row + 2, column=2,
+                     value=_fmt_number(sd.get("expected_3m_return"), "percent"))
+        ws_seas.cell(row=summary_row + 3, column=1, value="Seasonal Fair Value")
+        ws_seas.cell(row=summary_row + 3, column=2,
+                     value=_fmt_number(seasonal_result.fair_value, "currency"))
+        ws_seas.cell(row=summary_row + 4, column=1, value="Years of Data")
+        ws_seas.cell(row=summary_row + 4, column=2,
+                     value=sd.get("years_of_data"))
+
+        ws_seas.column_dimensions["A"].width = 24
+        ws_seas.column_dimensions["B"].width = 14
+        ws_seas.column_dimensions["C"].width = 12
+        ws_seas.column_dimensions["D"].width = 10
+    else:
+        ws_seas["A1"].value = "Seasonal Analysis — Insufficient Data"
+        ws_seas["A1"].font = Font(size=14, bold=True,
+                                  color=cfg.COLOR_SCHEME["negative"])
+        if seasonal_result:
+            ws_seas["A3"].value = seasonal_result.details.get("error", "")
+
+    # ── Sheet 8: Company Profile ──
     ws6 = wb.create_sheet("Company Profile")
     ws6.sheet_properties.tabColor = "ED7D31"
 
@@ -1185,7 +1497,7 @@ def generate_excel_report(ticker: str, data: dict, results: list,
     ws6.column_dimensions["A"].width = 24
     ws6.column_dimensions["B"].width = 20
 
-    # ── Sheet 7: Price History Chart Data ──
+    # ── Sheet 9: Price History Chart Data ──
     ws7 = wb.create_sheet("Price History")
     ws7.sheet_properties.tabColor = "5B9BD5"
 
@@ -1304,7 +1616,7 @@ def analyze_stock(ticker: str) -> str:
     print(f"{'━' * 60}")
 
     # Step 1: Fetch data
-    print("\n[1/6] Fetching market data...")
+    print("\n[1/7] Fetching market data...")
     data = fetch_yfinance_data(ticker)
 
     if not data.get("info"):
@@ -1312,22 +1624,25 @@ def analyze_stock(ticker: str) -> str:
         return ""
 
     # Step 2: Run valuation models
-    print("[2/6] Running DCF valuation...")
+    print("[2/7] Running DCF valuation...")
     dcf = dcf_valuation(data)
 
-    print("[3/6] Running comparable companies analysis...")
+    print("[3/7] Running comparable companies analysis...")
     comps = comps_valuation(data, ticker)
 
-    print("[4/6] Gathering analyst price targets...")
+    print("[4/7] Gathering analyst price targets...")
     analyst = analyst_valuation(data)
 
-    print("[5/6] Running technical analysis...")
+    print("[5/7] Running technical analysis...")
     tech = technical_valuation(data)
 
-    print("[6/6] Analyzing sentiment...")
+    print("[6/7] Analyzing sentiment...")
     sent = sentiment_valuation(data, ticker)
 
-    results = [dcf, comps, analyst, tech, sent]
+    print("[7/7] Analyzing seasonal patterns...")
+    seas = seasonal_valuation(data)
+
+    results = [dcf, comps, analyst, tech, sent, seas]
 
     # Composite
     composite = composite_valuation(results, cfg.VALUATION_WEIGHTS)
