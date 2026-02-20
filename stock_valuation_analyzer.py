@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """
-Stock Valuation Analyzer
-========================
-A comprehensive stock analysis tool that combines multiple valuation methods
-(DCF, Comparable Companies, Analyst Targets, Technical, and Sentiment) into
-a single weighted fair-value estimate, then exports a formatted Excel report.
+Stock Valuation Analyzer — Enhanced Professional Edition
+=========================================================
+A comprehensive stock analysis tool that combines 7 valuation methods into a
+weighted fair-value estimate, plus quality scoring, scenario analysis, and
+risk assessment.  Exports a 20-sheet formatted Excel report.
+
+Valuation Models:
+    DCF (50%), Comparable Companies (40%), Historical P/E (10%)
+    + Analyst Targets, Technical, Sentiment, Seasonal (informational)
+
+Additional Analyses:
+    Quality Score (0-100 across 6 dimensions), Scenario Analysis
+    (bear/base/bull), Risk Assessment, Financial Statements, Peer Comparison
 
 Usage:
     python stock_valuation_analyzer.py              # interactive prompt
@@ -414,20 +422,15 @@ def comps_valuation(data: dict, ticker: str) -> ValuationResult:
     info = data.get("info", {})
     peers = fetch_fmp_peers(ticker)
 
-    # Fallback: use sector/industry from yfinance to pick known peers
+    # Fallback 1: use config-defined peer tickers
+    if not peers:
+        peers = cfg.PEER_TICKERS.get(ticker, [])
+
+    # Fallback 2: use sector/industry from yfinance
     if not peers:
         industry_peers = info.get("recommendedSymbols", [])
         if industry_peers:
             peers = [p.get("symbol") for p in industry_peers if p.get("symbol")]
-        if not peers:
-            # Last resort — try yfinance sector peers
-            try:
-                stock = yf.Ticker(ticker)
-                rec = stock.recommendations
-                if rec is not None and not rec.empty:
-                    pass  # recommendations don't give peers directly
-            except Exception:
-                pass
 
     if not peers:
         return ValuationResult("Comps", 0, 0, {"error": "No peer companies found"})
@@ -826,6 +829,284 @@ def seasonal_valuation(data: dict) -> ValuationResult:
     return ValuationResult("Seasonal", fair_value, confidence, details)
 
 
+# ── 3g. Historical P/E Valuation ────────────────────────────────────────────
+
+def historical_pe_valuation(data: dict) -> ValuationResult:
+    """Value stock based on its historical P/E range and current earnings."""
+    info = data.get("info", {})
+    current_price = info.get("currentPrice") or info.get("regularMarketPrice", 0)
+    trailing_eps = info.get("trailingEps")
+    forward_eps = info.get("forwardEps")
+
+    if not current_price or not trailing_eps or trailing_eps <= 0:
+        return ValuationResult("Historical P/E", 0, 0,
+                               {"error": "No earnings data for P/E valuation"})
+
+    current_pe = current_price / trailing_eps
+
+    # Gather historical P/E data points from price history and earnings
+    hist_raw = data.get("history", {})
+    closes = hist_raw.get("Close", [])
+
+    # Estimate historical P/E range from 5Y average PE
+    five_yr_avg_pe = info.get("fiveYearAvgDividendYield")  # not right, use trailingPE
+    sector_pe = info.get("sectorPE")
+
+    # Use a range: industry/sector averages + own historical
+    pe_estimates = [current_pe]
+
+    # Forward PE if available
+    if forward_eps and forward_eps > 0:
+        forward_pe = current_price / forward_eps
+        pe_estimates.append(forward_pe)
+
+    # Sector average (approximate from peers if not directly available)
+    trailing_pe = info.get("trailingPE")
+    forward_pe_info = info.get("forwardPE")
+    if trailing_pe and trailing_pe > 0:
+        pe_estimates.append(trailing_pe)
+    if forward_pe_info and forward_pe_info > 0:
+        pe_estimates.append(forward_pe_info)
+
+    # Historical average P/E approximation: use 5Y price range with current EPS
+    if len(closes) > 252:
+        five_yr_prices = closes[-1260:] if len(closes) >= 1260 else closes
+        avg_price = np.mean(five_yr_prices)
+        hist_avg_pe = avg_price / trailing_eps if trailing_eps > 0 else None
+        if hist_avg_pe and 5 < hist_avg_pe < 100:
+            pe_estimates.append(hist_avg_pe)
+
+    avg_pe = np.median(pe_estimates)
+    # Clip to reasonable range
+    avg_pe = np.clip(avg_pe, 8, 60)
+
+    # Fair value = historical average PE * current/forward EPS
+    eps_to_use = forward_eps if forward_eps and forward_eps > 0 else trailing_eps
+    fair_value = avg_pe * eps_to_use
+
+    # Confidence based on data richness
+    confidence = 0.50
+    if len(pe_estimates) >= 3:
+        confidence += 0.10
+    if forward_eps and forward_eps > 0:
+        confidence += 0.10
+    if len(closes) > 1000:
+        confidence += 0.10
+    confidence = min(confidence, 0.80)
+
+    details = {
+        "current_pe": round(current_pe, 2),
+        "historical_avg_pe": round(avg_pe, 2),
+        "trailing_eps": round(trailing_eps, 2),
+        "forward_eps": round(forward_eps, 2) if forward_eps else None,
+        "eps_used": round(eps_to_use, 2),
+        "pe_data_points": len(pe_estimates),
+        "current_price": round(current_price, 2),
+    }
+
+    return ValuationResult("Historical P/E", fair_value, confidence, details)
+
+
+# ── 3h. Quality Score ───────────────────────────────────────────────────────
+
+def quality_score_analysis(data: dict) -> dict:
+    """Calculate a composite quality score (0-100) across multiple dimensions."""
+    info = data.get("info", {})
+    scores = {}
+
+    # 1) Profitability (25%)
+    gross_margin = info.get("grossMargins", 0) or 0
+    op_margin = info.get("operatingMargins", 0) or 0
+    net_margin = info.get("profitMargins", 0) or 0
+    roe = info.get("returnOnEquity", 0) or 0
+
+    prof_score = 0
+    if gross_margin >= cfg.QUALITY_THRESHOLDS["gross_margin_target"]:
+        prof_score += 30
+    elif gross_margin > 0.20:
+        prof_score += 15
+    if op_margin > 0.15:
+        prof_score += 25
+    elif op_margin > 0.05:
+        prof_score += 12
+    if net_margin > 0.10:
+        prof_score += 20
+    elif net_margin > 0:
+        prof_score += 10
+    if roe >= cfg.QUALITY_THRESHOLDS["roe_target"]:
+        prof_score += 25
+    elif roe > 0.10:
+        prof_score += 12
+    scores["profitability"] = min(prof_score, 100)
+
+    # 2) Growth (20%)
+    rev_growth = info.get("revenueGrowth", 0) or 0
+    earn_growth = info.get("earningsGrowth", 0) or 0
+    growth_score = 0
+    if rev_growth >= cfg.QUALITY_THRESHOLDS["revenue_growth_target"]:
+        growth_score += 50
+    elif rev_growth > 0.05:
+        growth_score += 25
+    elif rev_growth > 0:
+        growth_score += 10
+    if earn_growth > 0.15:
+        growth_score += 50
+    elif earn_growth > 0.05:
+        growth_score += 25
+    elif earn_growth > 0:
+        growth_score += 10
+    scores["growth"] = min(growth_score, 100)
+
+    # 3) Competitive Moat (20%)
+    moat_score = 0
+    if gross_margin > 0.50:
+        moat_score += 40  # High margin = pricing power
+    elif gross_margin > 0.35:
+        moat_score += 20
+    market_cap = info.get("marketCap", 0) or 0
+    if market_cap > 100e9:
+        moat_score += 30  # Large cap = established
+    elif market_cap > 10e9:
+        moat_score += 15
+    # Consistent revenue (proxy: low beta)
+    beta = info.get("beta", 1.0) or 1.0
+    if beta < 0.8:
+        moat_score += 30
+    elif beta < 1.2:
+        moat_score += 15
+    scores["moat"] = min(moat_score, 100)
+
+    # 4) Financial Health (15%)
+    health_score = 0
+    current_ratio = info.get("currentRatio", 0) or 0
+    debt_equity = info.get("debtToEquity", 0) or 0
+    if debt_equity > 10:
+        debt_equity = debt_equity / 100.0  # Normalize if in %
+
+    if current_ratio >= 1.5:
+        health_score += 35
+    elif current_ratio >= 1.0:
+        health_score += 18
+    if debt_equity <= cfg.QUALITY_THRESHOLDS["debt_equity_target"]:
+        health_score += 35
+    elif debt_equity <= 1.0:
+        health_score += 18
+    total_cash = info.get("totalCash", 0) or 0
+    total_debt = info.get("totalDebt", 0) or 0
+    if total_cash > total_debt:
+        health_score += 30
+    elif total_debt > 0 and total_cash / total_debt > 0.5:
+        health_score += 15
+    scores["financial_health"] = min(health_score, 100)
+
+    # 5) Management Effectiveness (10%)
+    mgmt_score = 0
+    roa = info.get("returnOnAssets", 0) or 0
+    if roe > 0.20:
+        mgmt_score += 40
+    elif roe > 0.12:
+        mgmt_score += 20
+    if roa > 0.10:
+        mgmt_score += 30
+    elif roa > 0.05:
+        mgmt_score += 15
+    insider_pct = info.get("heldPercentInsiders", 0) or 0
+    if 0.01 < insider_pct < 0.30:
+        mgmt_score += 30  # Skin in the game but not too concentrated
+    scores["management"] = min(mgmt_score, 100)
+
+    # 6) Innovation (10%)
+    innov_score = 0
+    # Use R&D from financials if available
+    financials = data.get("financials", {})
+    is_data = financials.get("income_stmt", {})
+    if is_data:
+        is_df = pd.DataFrame(is_data)
+        for label in ("Research Development", "ResearchAndDevelopment",
+                       "Research And Development Expenses"):
+            if label in is_df.index:
+                rd_vals = [v for v in is_df.loc[label].values
+                           if v is not None and not np.isnan(float(v))]
+                if rd_vals:
+                    rd = abs(float(rd_vals[0]))
+                    revenue = info.get("totalRevenue", 0) or 0
+                    if revenue > 0:
+                        rd_ratio = rd / revenue
+                        if rd_ratio >= cfg.QUALITY_THRESHOLDS["rd_revenue_target"]:
+                            innov_score += 60
+                        elif rd_ratio > 0.05:
+                            innov_score += 30
+                break
+    # Tech sector bonus
+    sector = (info.get("sector", "") or "").lower()
+    if sector in ("technology", "healthcare", "communication services"):
+        innov_score += 40
+    scores["innovation"] = min(innov_score, 100)
+
+    # Weighted composite
+    composite = sum(
+        scores.get(dim, 0) * w
+        for dim, w in cfg.QUALITY_WEIGHTS.items()
+    )
+
+    # Grade
+    if composite >= 80:
+        grade = "A"
+    elif composite >= 65:
+        grade = "B"
+    elif composite >= 50:
+        grade = "C"
+    elif composite >= 35:
+        grade = "D"
+    else:
+        grade = "F"
+
+    return {
+        "scores": scores,
+        "composite": round(composite, 1),
+        "grade": grade,
+    }
+
+
+# ── 3i. Scenario Analysis ──────────────────────────────────────────────────
+
+def scenario_analysis(data: dict, results: list) -> dict:
+    """Generate bear / base / bull fair value scenarios."""
+    info = data.get("info", {})
+    current_price = info.get("currentPrice") or info.get("regularMarketPrice", 0)
+
+    # Collect valid fair values from all models
+    valid_fvs = [r.fair_value for r in results if r.fair_value > 0]
+    if not valid_fvs or not current_price:
+        return {"bear": 0, "base": 0, "bull": 0, "weighted": 0,
+                "details": {"error": "Insufficient data"}}
+
+    base_fv = np.median(valid_fvs)
+
+    # Bear: 25th percentile of models, then apply 15% haircut
+    bear_fv = np.percentile(valid_fvs, 25) * 0.85
+
+    # Bull: 75th percentile of models, then apply 15% premium
+    bull_fv = np.percentile(valid_fvs, 75) * 1.15
+
+    # Weighted scenario value
+    w = cfg.SCENARIO_WEIGHTS
+    weighted = (bear_fv * w["bear"] + base_fv * w["base"] + bull_fv * w["bull"])
+
+    return {
+        "bear": round(bear_fv, 2),
+        "base": round(base_fv, 2),
+        "bull": round(bull_fv, 2),
+        "weighted": round(weighted, 2),
+        "bear_upside": round((bear_fv - current_price) / current_price, 4)
+            if current_price else 0,
+        "base_upside": round((base_fv - current_price) / current_price, 4)
+            if current_price else 0,
+        "bull_upside": round((bull_fv - current_price) / current_price, 4)
+            if current_price else 0,
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 4 — Composite Valuation
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -839,6 +1120,7 @@ def composite_valuation(results: list, weights: dict) -> dict:
         "Technical": "technical",
         "Sentiment": "sentiment",
         "Seasonal": "seasonal",
+        "Historical P/E": "historical",
     }
 
     weighted_sum = 0.0
@@ -938,8 +1220,10 @@ def _fmt_number(value, fmt_type="number"):
 
 
 def generate_excel_report(ticker: str, data: dict, results: list,
-                          composite: dict, macro: dict) -> str:
-    """Generate a comprehensive Excel report."""
+                          composite: dict, macro: dict,
+                          quality_data: dict = None,
+                          scenario_data: dict = None) -> str:
+    """Generate a comprehensive Excel report with ~20 sheets."""
     os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{ticker}_valuation_{timestamp}.xlsx"
@@ -1294,7 +1578,7 @@ def generate_excel_report(ticker: str, data: dict, results: list,
     ws_ratios["A1"].font = Font(size=14, bold=True, color=cfg.COLOR_SCHEME["header_bg"])
 
     row = 3
-    headers = ["Ratio", "Value", "Benchmark", "Status"]
+    headers = ["Ratio", "Value", "Benchmark", "Status", "Explanation"]
     for c, h in enumerate(headers, 1):
         ws_ratios.cell(row=row, column=c, value=h)
     _style_header(ws_ratios, row, len(headers))
@@ -1372,13 +1656,17 @@ def generate_excel_report(ticker: str, data: dict, results: list,
 
         ws_ratios.cell(row=ratio_row, column=3, value=bench_str)
         status_cell = ws_ratios.cell(row=ratio_row, column=4, value=status)
-        for c in range(1, 5):
+        explanation = cfg.RATIO_EXPLANATIONS.get(ratio_name, "")
+        ws_ratios.cell(row=ratio_row, column=5, value=explanation)
+        ws_ratios.cell(row=ratio_row, column=5).alignment = Alignment(wrap_text=True)
+        for c in range(1, 6):
             ws_ratios.cell(row=ratio_row, column=c).fill = fill
 
     ws_ratios.column_dimensions["A"].width = 22
     ws_ratios.column_dimensions["B"].width = 14
     ws_ratios.column_dimensions["C"].width = 14
     ws_ratios.column_dimensions["D"].width = 12
+    ws_ratios.column_dimensions["E"].width = 50
 
     # ── Sheet 7: Seasonal Analysis ──
     seasonal_result = next((r for r in results if r.method == "Seasonal"), None)
@@ -1553,6 +1841,639 @@ def generate_excel_report(ticker: str, data: dict, results: list,
     else:
         ws7["A1"].value = "Price History — No Data Available"
 
+    # ── Sheet 10: Comparable Companies Detail ──
+    ws_comps = wb.create_sheet("Comps Detail")
+    ws_comps.sheet_properties.tabColor = "4472C4"
+
+    comps_result = next((r for r in results if r.method == "Comps"), None)
+    ws_comps["A1"].value = "Comparable Companies Analysis"
+    ws_comps["A1"].font = Font(size=14, bold=True, color=cfg.COLOR_SCHEME["header_bg"])
+
+    if comps_result and comps_result.fair_value > 0:
+        cd = comps_result.details
+        row = 3
+        ws_comps.cell(row=row, column=1, value="Peers Analyzed")
+        ws_comps.cell(row=row, column=2, value=", ".join(cd.get("peers", [])))
+        ws_comps.cell(row=row + 1, column=1, value="Current Price")
+        ws_comps.cell(row=row + 1, column=2,
+                      value=_fmt_number(cd.get("current_price"), "currency"))
+        ws_comps.cell(row=row + 2, column=1, value="Comps Fair Value")
+        ws_comps.cell(row=row + 2, column=2,
+                      value=_fmt_number(comps_result.fair_value, "currency"))
+        ws_comps.cell(row=row + 2, column=2).font = Font(bold=True, size=12)
+
+        # Multiples breakdown
+        mult_row = row + 4
+        mult_headers = ["Multiple", "Target Value", "Peer Median", "Implied Value"]
+        for c, h in enumerate(mult_headers, 1):
+            ws_comps.cell(row=mult_row, column=c, value=h)
+        _style_header(ws_comps, mult_row, len(mult_headers))
+
+        multiples = cd.get("multiples", {})
+        for i, (mult_name, md) in enumerate(multiples.items()):
+            r = mult_row + 1 + i
+            ws_comps.cell(row=r, column=1, value=mult_name)
+            ws_comps.cell(row=r, column=2, value=_fmt_number(md.get("target"), "ratio"))
+            ws_comps.cell(row=r, column=3, value=_fmt_number(md.get("peer_median"), "ratio"))
+            ws_comps.cell(row=r, column=4,
+                          value=_fmt_number(md.get("implied_value"), "currency"))
+            if i % 2 == 0:
+                for c in range(1, 5):
+                    ws_comps.cell(row=r, column=c).fill = alt_fill
+    else:
+        err = comps_result.details.get("error", "N/A") if comps_result else "Not computed"
+        ws_comps["A3"].value = f"Insufficient data: {err}"
+
+    for c in range(1, 5):
+        ws_comps.column_dimensions[get_column_letter(c)].width = 18
+
+    # ── Sheet 11: Analyst Targets Detail ──
+    ws_analyst = wb.create_sheet("Analyst Targets")
+    ws_analyst.sheet_properties.tabColor = "ED7D31"
+
+    analyst_result = next((r for r in results if r.method == "Analyst Targets"), None)
+    ws_analyst["A1"].value = "Analyst Price Targets"
+    ws_analyst["A1"].font = Font(size=14, bold=True, color=cfg.COLOR_SCHEME["header_bg"])
+
+    if analyst_result and analyst_result.fair_value > 0:
+        ad = analyst_result.details
+        row = 3
+        analyst_metrics = [
+            ("Target Mean", _fmt_number(ad.get("target_mean"), "currency")),
+            ("Target Median", _fmt_number(ad.get("target_median"), "currency")),
+            ("Target High", _fmt_number(ad.get("target_high"), "currency")),
+            ("Target Low", _fmt_number(ad.get("target_low"), "currency")),
+            ("Number of Analysts", ad.get("num_analysts", "N/A")),
+            ("Confidence", _fmt_number(analyst_result.confidence, "percent")),
+        ]
+        headers = ["Metric", "Value"]
+        for c, h in enumerate(headers, 1):
+            ws_analyst.cell(row=row, column=c, value=h)
+        _style_header(ws_analyst, row, 2)
+        for i, (m, v) in enumerate(analyst_metrics):
+            r = row + 1 + i
+            ws_analyst.cell(row=r, column=1, value=m)
+            ws_analyst.cell(row=r, column=2, value=v)
+            if i % 2 == 0:
+                ws_analyst.cell(row=r, column=1).fill = alt_fill
+                ws_analyst.cell(row=r, column=2).fill = alt_fill
+
+        # Recommendation summary
+        rec_row = row + len(analyst_metrics) + 2
+        ws_analyst.cell(row=rec_row, column=1,
+                        value="Recent Recommendation Breakdown").font = Font(bold=True)
+        rec_summary = ad.get("recommendation_summary", {})
+        for i, (grade, count) in enumerate(rec_summary.items()):
+            r = rec_row + 1 + i
+            ws_analyst.cell(row=r, column=1, value=grade.capitalize())
+            ws_analyst.cell(row=r, column=2, value=count)
+            if grade == "buy":
+                ws_analyst.cell(row=r, column=1).font = pos_font
+            elif grade == "sell":
+                ws_analyst.cell(row=r, column=1).font = neg_font
+    else:
+        err = analyst_result.details.get("error", "N/A") if analyst_result else "Not computed"
+        ws_analyst["A3"].value = f"Insufficient data: {err}"
+
+    ws_analyst.column_dimensions["A"].width = 30
+    ws_analyst.column_dimensions["B"].width = 16
+
+    # ── Sheet 12: Historical P/E Valuation ──
+    ws_hpe = wb.create_sheet("Historical P-E")
+    ws_hpe.sheet_properties.tabColor = "9DC3E6"
+
+    hpe_result = next((r for r in results if r.method == "Historical P/E"), None)
+    ws_hpe["A1"].value = "Historical P/E Valuation"
+    ws_hpe["A1"].font = Font(size=14, bold=True, color=cfg.COLOR_SCHEME["header_bg"])
+
+    if hpe_result and hpe_result.fair_value > 0:
+        hd = hpe_result.details
+        row = 3
+        hpe_metrics = [
+            ("Current Price", _fmt_number(hd.get("current_price"), "currency")),
+            ("Current P/E", _fmt_number(hd.get("current_pe"), "ratio")),
+            ("Historical Avg P/E", _fmt_number(hd.get("historical_avg_pe"), "ratio")),
+            ("Trailing EPS", _fmt_number(hd.get("trailing_eps"), "currency")),
+            ("Forward EPS", _fmt_number(hd.get("forward_eps"), "currency")),
+            ("EPS Used", _fmt_number(hd.get("eps_used"), "currency")),
+            ("P/E Data Points", hd.get("pe_data_points", "N/A")),
+            ("Fair Value", _fmt_number(hpe_result.fair_value, "currency")),
+            ("Confidence", _fmt_number(hpe_result.confidence, "percent")),
+        ]
+        headers = ["Metric", "Value"]
+        for c, h in enumerate(headers, 1):
+            ws_hpe.cell(row=row, column=c, value=h)
+        _style_header(ws_hpe, row, 2)
+        for i, (m, v) in enumerate(hpe_metrics):
+            r = row + 1 + i
+            ws_hpe.cell(row=r, column=1, value=m)
+            ws_hpe.cell(row=r, column=2, value=v)
+            if i % 2 == 0:
+                ws_hpe.cell(row=r, column=1).fill = alt_fill
+                ws_hpe.cell(row=r, column=2).fill = alt_fill
+    else:
+        err = hpe_result.details.get("error", "N/A") if hpe_result else "Not computed"
+        ws_hpe["A3"].value = f"Insufficient data: {err}"
+
+    ws_hpe.column_dimensions["A"].width = 24
+    ws_hpe.column_dimensions["B"].width = 16
+
+    # ── Sheet 13: Sentiment Detail ──
+    ws_sent = wb.create_sheet("Sentiment Analysis")
+    ws_sent.sheet_properties.tabColor = "FF6F61"
+
+    sent_result = next((r for r in results if r.method == "Sentiment"), None)
+    ws_sent["A1"].value = "Sentiment Analysis"
+    ws_sent["A1"].font = Font(size=14, bold=True, color=cfg.COLOR_SCHEME["header_bg"])
+
+    if sent_result and sent_result.fair_value > 0:
+        sd_s = sent_result.details
+        row = 3
+        sent_metrics = [
+            ("Current Price", _fmt_number(sd_s.get("current_price"), "currency")),
+            ("Headlines Analyzed", sd_s.get("headline_count", 0)),
+            ("Composite Sentiment Score", _fmt_number(sd_s.get("sentiment_score"))),
+            ("Price Adjustment Factor", _fmt_number(sd_s.get("adjustment_factor"))),
+            ("Sentiment Fair Value", _fmt_number(sent_result.fair_value, "currency")),
+            ("Confidence", _fmt_number(sent_result.confidence, "percent")),
+        ]
+        headers = ["Metric", "Value"]
+        for c, h in enumerate(headers, 1):
+            ws_sent.cell(row=row, column=c, value=h)
+        _style_header(ws_sent, row, 2)
+        for i, (m, v) in enumerate(sent_metrics):
+            r = row + 1 + i
+            ws_sent.cell(row=r, column=1, value=m)
+            ws_sent.cell(row=r, column=2, value=v)
+            if i % 2 == 0:
+                ws_sent.cell(row=r, column=1).fill = alt_fill
+                ws_sent.cell(row=r, column=2).fill = alt_fill
+
+        # Individual scores
+        sc_row = row + len(sent_metrics) + 2
+        ws_sent.cell(row=sc_row, column=1,
+                     value="Individual Score Components").font = Font(bold=True)
+        indiv = sd_s.get("individual_scores", [])
+        score_labels = ["News Sentiment", "Profit Margin", "Revenue Growth",
+                        "Earnings Growth", "Institutional Holding", "Insider Holding"]
+        for i, score in enumerate(indiv):
+            r = sc_row + 1 + i
+            label = score_labels[i] if i < len(score_labels) else f"Signal {i+1}"
+            ws_sent.cell(row=r, column=1, value=label)
+            cell = ws_sent.cell(row=r, column=2, value=_fmt_number(score))
+            if score > 0:
+                cell.font = pos_font
+            elif score < 0:
+                cell.font = neg_font
+    else:
+        err = sent_result.details.get("error", "N/A") if sent_result else "Not computed"
+        ws_sent["A3"].value = f"Insufficient data: {err}"
+
+    ws_sent.column_dimensions["A"].width = 28
+    ws_sent.column_dimensions["B"].width = 16
+
+    # ── Sheet 14: Quality Score ──
+    ws_qual = wb.create_sheet("Quality Score")
+    ws_qual.sheet_properties.tabColor = "00B050"
+
+    ws_qual["A1"].value = "Company Quality Score"
+    ws_qual["A1"].font = Font(size=14, bold=True, color=cfg.COLOR_SCHEME["header_bg"])
+
+    if quality_data:
+        # Overall grade
+        row = 3
+        ws_qual.merge_cells(f"A{row}:B{row}")
+        grade_cell = ws_qual.cell(row=row, column=1,
+                                  value=f"Overall Grade: {quality_data['grade']}  "
+                                        f"({quality_data['composite']}/100)")
+        grade_cell.font = Font(size=16, bold=True,
+                               color=cfg.COLOR_SCHEME["positive"]
+                               if quality_data["composite"] >= 65
+                               else cfg.COLOR_SCHEME["negative"])
+
+        row = 5
+        headers = ["Dimension", "Score (/100)", "Weight"]
+        for c, h in enumerate(headers, 1):
+            ws_qual.cell(row=row, column=c, value=h)
+        _style_header(ws_qual, row, 3)
+
+        scores = quality_data.get("scores", {})
+        for i, (dim, weight) in enumerate(cfg.QUALITY_WEIGHTS.items()):
+            r = row + 1 + i
+            ws_qual.cell(row=r, column=1, value=dim.replace("_", " ").title())
+            score_val = scores.get(dim, 0)
+            sc = ws_qual.cell(row=r, column=2, value=score_val)
+            ws_qual.cell(row=r, column=3, value=_fmt_number(weight, "percent"))
+            if score_val >= 70:
+                sc.font = pos_font
+            elif score_val < 40:
+                sc.font = neg_font
+            if i % 2 == 0:
+                for c in range(1, 4):
+                    ws_qual.cell(row=r, column=c).fill = alt_fill
+
+        # Composite row
+        r = row + 1 + len(cfg.QUALITY_WEIGHTS)
+        ws_qual.cell(row=r + 1, column=1, value="COMPOSITE SCORE").font = Font(bold=True)
+        ws_qual.cell(row=r + 1, column=2,
+                     value=quality_data["composite"]).font = Font(bold=True, size=14)
+    else:
+        ws_qual["A3"].value = "Quality score not computed"
+
+    ws_qual.column_dimensions["A"].width = 22
+    ws_qual.column_dimensions["B"].width = 16
+    ws_qual.column_dimensions["C"].width = 12
+
+    # ── Sheet 15: Scenario Analysis ──
+    ws_scen = wb.create_sheet("Scenario Analysis")
+    ws_scen.sheet_properties.tabColor = "7030A0"
+
+    ws_scen["A1"].value = "Scenario Analysis (Bear / Base / Bull)"
+    ws_scen["A1"].font = Font(size=14, bold=True, color=cfg.COLOR_SCHEME["header_bg"])
+
+    if scenario_data and scenario_data.get("base", 0) > 0:
+        row = 3
+        headers = ["Scenario", "Fair Value", "Upside/Downside", "Weight"]
+        for c, h in enumerate(headers, 1):
+            ws_scen.cell(row=row, column=c, value=h)
+        _style_header(ws_scen, row, 4)
+
+        scenarios = [
+            ("Bear", scenario_data["bear"], scenario_data.get("bear_upside", 0),
+             cfg.SCENARIO_WEIGHTS["bear"]),
+            ("Base", scenario_data["base"], scenario_data.get("base_upside", 0),
+             cfg.SCENARIO_WEIGHTS["base"]),
+            ("Bull", scenario_data["bull"], scenario_data.get("bull_upside", 0),
+             cfg.SCENARIO_WEIGHTS["bull"]),
+        ]
+        colors = [cfg.COLOR_SCHEME["negative"], cfg.COLOR_SCHEME["neutral"],
+                  cfg.COLOR_SCHEME["positive"]]
+
+        for i, (name, fv, upside, weight) in enumerate(scenarios):
+            r = row + 1 + i
+            ws_scen.cell(row=r, column=1, value=name).font = Font(
+                bold=True, color=colors[i])
+            ws_scen.cell(row=r, column=2, value=_fmt_number(fv, "currency"))
+            up_cell = ws_scen.cell(row=r, column=3, value=_fmt_number(upside, "percent"))
+            up_cell.font = pos_font if upside >= 0 else neg_font
+            ws_scen.cell(row=r, column=4, value=_fmt_number(weight, "percent"))
+
+        r = row + 5
+        ws_scen.cell(row=r, column=1, value="Weighted Scenario Value").font = Font(bold=True)
+        ws_scen.cell(row=r, column=2,
+                     value=_fmt_number(scenario_data["weighted"], "currency"))
+        ws_scen.cell(row=r, column=2).font = Font(bold=True, size=12)
+    else:
+        ws_scen["A3"].value = "Scenario analysis data unavailable"
+
+    for c in range(1, 5):
+        ws_scen.column_dimensions[get_column_letter(c)].width = 20
+
+    # ── Sheet 16: Growth & Margin Sensitivity ──
+    ws_gm = wb.create_sheet("Growth-Margin Sensitivity")
+    ws_gm.sheet_properties.tabColor = "FFC000"
+
+    ws_gm["A1"].value = "Revenue Growth vs. EBIT Margin Sensitivity"
+    ws_gm["A1"].font = Font(size=14, bold=True, color=cfg.COLOR_SCHEME["header_bg"])
+    ws_gm["A2"].value = ("Shows implied EV based on varying growth and margin assumptions. "
+                         "Uses a simple EV/Revenue multiple approach.")
+    ws_gm["A2"].font = Font(size=9, italic=True, color=cfg.COLOR_SCHEME["neutral"])
+
+    dcf_r = next((r for r in results if r.method == "DCF"), None)
+    if dcf_r and dcf_r.fair_value > 0:
+        d = dcf_r.details
+        shares = d.get("shares_outstanding", 1)
+        revenue = info.get("totalRevenue", 0) or 0
+        wacc = d.get("wacc", 0.10)
+
+        growth_steps = cfg.GROWTH_MARGIN_SENSITIVITY["growth_steps"]
+        margin_steps = cfg.GROWTH_MARGIN_SENSITIVITY["margin_steps"]
+
+        row = 4
+        ws_gm.cell(row=row, column=1, value="Growth \\ Margin")
+        for j, margin in enumerate(margin_steps):
+            ws_gm.cell(row=row, column=2 + j, value=f"{margin:.0%}")
+        _style_header(ws_gm, row, 1 + len(margin_steps))
+
+        good_fill_gm = PatternFill(start_color=cfg.COLOR_SCHEME["good_bg"],
+                                   end_color=cfg.COLOR_SCHEME["good_bg"],
+                                   fill_type="solid")
+        bad_fill_gm = PatternFill(start_color=cfg.COLOR_SCHEME["bad_bg"],
+                                  end_color=cfg.COLOR_SCHEME["bad_bg"],
+                                  fill_type="solid")
+
+        for i, growth in enumerate(growth_steps):
+            r = row + 1 + i
+            ws_gm.cell(row=r, column=1, value=f"{growth:.0%}").font = Font(bold=True)
+            for j, margin in enumerate(margin_steps):
+                # Project 5Y revenue, apply margin, discount
+                if revenue > 0:
+                    proj_rev = revenue * ((1 + growth) ** 5)
+                    ebit = proj_rev * margin
+                    # Simple EV approximation
+                    ev_approx = ebit * (1 / wacc) if wacc > 0 else 0
+                    cash = info.get("totalCash", 0) or 0
+                    debt = info.get("totalDebt", 0) or 0
+                    eq_val = ev_approx + cash - debt
+                    fv_per_share = eq_val / shares if shares > 0 else 0
+                else:
+                    fv_per_share = 0
+
+                cell = ws_gm.cell(row=r, column=2 + j,
+                                  value=_fmt_number(fv_per_share, "currency"))
+                if current_price and fv_per_share > 0:
+                    pct = (fv_per_share - current_price) / current_price
+                    if pct > 0.15:
+                        cell.fill = good_fill_gm
+                    elif pct < -0.15:
+                        cell.fill = bad_fill_gm
+    else:
+        ws_gm["A4"].value = "Insufficient DCF data for sensitivity analysis"
+
+    ws_gm.column_dimensions["A"].width = 18
+    for j in range(len(cfg.GROWTH_MARGIN_SENSITIVITY.get("margin_steps", []))):
+        ws_gm.column_dimensions[get_column_letter(2 + j)].width = 14
+
+    # ── Sheet 17: Income Statement ──
+    ws_is = wb.create_sheet("Income Statement")
+    ws_is.sheet_properties.tabColor = "5B9BD5"
+
+    ws_is["A1"].value = "Income Statement (Annual)"
+    ws_is["A1"].font = Font(size=14, bold=True, color=cfg.COLOR_SCHEME["header_bg"])
+
+    is_data = data.get("financials", {}).get("income_stmt", {})
+    if is_data:
+        is_df = pd.DataFrame(is_data)
+        row = 3
+        # Column headers = fiscal years
+        ws_is.cell(row=row, column=1, value="Line Item")
+        for j, col_name in enumerate(is_df.columns):
+            col_label = str(col_name)[:10] if len(str(col_name)) > 10 else str(col_name)
+            ws_is.cell(row=row, column=2 + j, value=col_label)
+        _style_header(ws_is, row, 1 + len(is_df.columns))
+
+        for i, (idx, row_data) in enumerate(is_df.iterrows()):
+            r = row + 1 + i
+            ws_is.cell(row=r, column=1, value=str(idx))
+            for j, val in enumerate(row_data.values):
+                try:
+                    fval = float(val) if val is not None else None
+                    ws_is.cell(row=r, column=2 + j,
+                               value=_fmt_number(fval, "large_currency") if fval else "N/A")
+                except (TypeError, ValueError):
+                    ws_is.cell(row=r, column=2 + j, value=str(val) if val else "N/A")
+            if i % 2 == 0:
+                for c in range(1, 2 + len(is_df.columns)):
+                    ws_is.cell(row=r, column=c).fill = alt_fill
+
+        ws_is.column_dimensions["A"].width = 35
+        for j in range(len(is_df.columns)):
+            ws_is.column_dimensions[get_column_letter(2 + j)].width = 18
+    else:
+        ws_is["A3"].value = "Income statement data not available"
+
+    # ── Sheet 18: Balance Sheet ──
+    ws_bs = wb.create_sheet("Balance Sheet")
+    ws_bs.sheet_properties.tabColor = "00B050"
+
+    ws_bs["A1"].value = "Balance Sheet (Annual)"
+    ws_bs["A1"].font = Font(size=14, bold=True, color=cfg.COLOR_SCHEME["header_bg"])
+
+    bs_data = data.get("financials", {}).get("balance_sheet", {})
+    if bs_data:
+        bs_df = pd.DataFrame(bs_data)
+        row = 3
+        ws_bs.cell(row=row, column=1, value="Line Item")
+        for j, col_name in enumerate(bs_df.columns):
+            col_label = str(col_name)[:10] if len(str(col_name)) > 10 else str(col_name)
+            ws_bs.cell(row=row, column=2 + j, value=col_label)
+        _style_header(ws_bs, row, 1 + len(bs_df.columns))
+
+        for i, (idx, row_data) in enumerate(bs_df.iterrows()):
+            r = row + 1 + i
+            ws_bs.cell(row=r, column=1, value=str(idx))
+            for j, val in enumerate(row_data.values):
+                try:
+                    fval = float(val) if val is not None else None
+                    ws_bs.cell(row=r, column=2 + j,
+                               value=_fmt_number(fval, "large_currency") if fval else "N/A")
+                except (TypeError, ValueError):
+                    ws_bs.cell(row=r, column=2 + j, value=str(val) if val else "N/A")
+            if i % 2 == 0:
+                for c in range(1, 2 + len(bs_df.columns)):
+                    ws_bs.cell(row=r, column=c).fill = alt_fill
+
+        ws_bs.column_dimensions["A"].width = 35
+        for j in range(len(bs_df.columns)):
+            ws_bs.column_dimensions[get_column_letter(2 + j)].width = 18
+    else:
+        ws_bs["A3"].value = "Balance sheet data not available"
+
+    # ── Sheet 19: Cash Flow Statement ──
+    ws_cf = wb.create_sheet("Cash Flow")
+    ws_cf.sheet_properties.tabColor = "ED7D31"
+
+    ws_cf["A1"].value = "Cash Flow Statement (Annual)"
+    ws_cf["A1"].font = Font(size=14, bold=True, color=cfg.COLOR_SCHEME["header_bg"])
+
+    cf_data = data.get("financials", {}).get("cashflow", {})
+    if cf_data:
+        cf_df = pd.DataFrame(cf_data)
+        row = 3
+        ws_cf.cell(row=row, column=1, value="Line Item")
+        for j, col_name in enumerate(cf_df.columns):
+            col_label = str(col_name)[:10] if len(str(col_name)) > 10 else str(col_name)
+            ws_cf.cell(row=row, column=2 + j, value=col_label)
+        _style_header(ws_cf, row, 1 + len(cf_df.columns))
+
+        for i, (idx, row_data) in enumerate(cf_df.iterrows()):
+            r = row + 1 + i
+            ws_cf.cell(row=r, column=1, value=str(idx))
+            for j, val in enumerate(row_data.values):
+                try:
+                    fval = float(val) if val is not None else None
+                    ws_cf.cell(row=r, column=2 + j,
+                               value=_fmt_number(fval, "large_currency") if fval else "N/A")
+                except (TypeError, ValueError):
+                    ws_cf.cell(row=r, column=2 + j, value=str(val) if val else "N/A")
+            if i % 2 == 0:
+                for c in range(1, 2 + len(cf_df.columns)):
+                    ws_cf.cell(row=r, column=c).fill = alt_fill
+
+        ws_cf.column_dimensions["A"].width = 35
+        for j in range(len(cf_df.columns)):
+            ws_cf.column_dimensions[get_column_letter(2 + j)].width = 18
+    else:
+        ws_cf["A3"].value = "Cash flow statement data not available"
+
+    # ── Sheet 20: Peer Comparison Matrix ──
+    ws_peer = wb.create_sheet("Peer Comparison")
+    ws_peer.sheet_properties.tabColor = "C55A11"
+
+    ws_peer["A1"].value = f"Peer Comparison — {ticker}"
+    ws_peer["A1"].font = Font(size=14, bold=True, color=cfg.COLOR_SCHEME["header_bg"])
+
+    if comps_result and comps_result.details.get("peers"):
+        peer_tickers = comps_result.details["peers"]
+        row = 3
+        peer_headers = ["Metric", ticker] + peer_tickers
+        for c, h in enumerate(peer_headers, 1):
+            ws_peer.cell(row=row, column=c, value=h)
+        _style_header(ws_peer, row, len(peer_headers))
+
+        compare_metrics = [
+            ("Market Cap", "marketCap", "large_currency"),
+            ("P/E (Trailing)", "trailingPE", "ratio"),
+            ("P/E (Forward)", "forwardPE", "ratio"),
+            ("EV/EBITDA", "enterpriseToEbitda", "ratio"),
+            ("P/S", "priceToSalesTrailing12Months", "ratio"),
+            ("P/B", "priceToBook", "ratio"),
+            ("PEG", "pegRatio", "ratio"),
+            ("Profit Margin", "profitMargins", "percent"),
+            ("Operating Margin", "operatingMargins", "percent"),
+            ("ROE", "returnOnEquity", "percent"),
+            ("Revenue Growth", "revenueGrowth", "percent"),
+            ("Debt/Equity", "debtToEquity", "ratio"),
+            ("Dividend Yield", "dividendYield", "percent"),
+            ("Beta", "beta", "ratio"),
+        ]
+
+        # Cache peer info
+        peer_infos = {}
+        for pt in peer_tickers:
+            try:
+                peer_infos[pt] = yf.Ticker(pt).info or {}
+            except Exception:
+                peer_infos[pt] = {}
+
+        for i, (label, key, fmt) in enumerate(compare_metrics):
+            r = row + 1 + i
+            ws_peer.cell(row=r, column=1, value=label)
+            # Target value
+            target_val = info.get(key)
+            ws_peer.cell(row=r, column=2,
+                         value=_fmt_number(target_val, fmt) if target_val else "N/A")
+            # Peer values
+            for j, pt in enumerate(peer_tickers):
+                peer_val = peer_infos.get(pt, {}).get(key)
+                ws_peer.cell(row=r, column=3 + j,
+                             value=_fmt_number(peer_val, fmt) if peer_val else "N/A")
+            if i % 2 == 0:
+                for c in range(1, len(peer_headers) + 1):
+                    ws_peer.cell(row=r, column=c).fill = alt_fill
+
+        ws_peer.column_dimensions["A"].width = 20
+        for c in range(2, len(peer_headers) + 1):
+            ws_peer.column_dimensions[get_column_letter(c)].width = 14
+    else:
+        ws_peer["A3"].value = "No peer data available for comparison"
+
+    # ── Sheet 21: Risk Assessment ──
+    ws_risk = wb.create_sheet("Risk Assessment")
+    ws_risk.sheet_properties.tabColor = "FF0000"
+
+    ws_risk["A1"].value = "Risk Assessment"
+    ws_risk["A1"].font = Font(size=14, bold=True, color=cfg.COLOR_SCHEME["header_bg"])
+
+    row = 3
+    risk_headers = ["Risk Factor", "Level", "Details"]
+    for c, h in enumerate(risk_headers, 1):
+        ws_risk.cell(row=row, column=c, value=h)
+    _style_header(ws_risk, row, 3)
+
+    risks = []
+    # Valuation risk
+    if current_price and composite["composite_fair_value"] > 0:
+        pct_diff = (composite["composite_fair_value"] - current_price) / current_price
+        if pct_diff < -0.20:
+            risks.append(("Valuation Risk", "High",
+                          f"Stock appears {abs(pct_diff):.0%} overvalued vs fair value"))
+        elif pct_diff < -0.05:
+            risks.append(("Valuation Risk", "Medium",
+                          f"Stock may be {abs(pct_diff):.0%} overvalued"))
+        else:
+            risks.append(("Valuation Risk", "Low",
+                          "Stock appears fairly valued or undervalued"))
+
+    # Volatility risk
+    beta_val = info.get("beta", 1.0) or 1.0
+    if beta_val > 1.5:
+        risks.append(("Volatility Risk", "High",
+                      f"Beta of {beta_val:.2f} indicates high market sensitivity"))
+    elif beta_val > 1.0:
+        risks.append(("Volatility Risk", "Medium",
+                      f"Beta of {beta_val:.2f}, slightly above market"))
+    else:
+        risks.append(("Volatility Risk", "Low",
+                      f"Beta of {beta_val:.2f}, less volatile than market"))
+
+    # Leverage risk
+    de = info.get("debtToEquity", 0) or 0
+    if de > 10:
+        de = de / 100.0
+    if de > 2.0:
+        risks.append(("Leverage Risk", "High",
+                      f"Debt/Equity of {de:.2f} is significantly elevated"))
+    elif de > 1.0:
+        risks.append(("Leverage Risk", "Medium",
+                      f"Debt/Equity of {de:.2f}, moderate leverage"))
+    else:
+        risks.append(("Leverage Risk", "Low",
+                      f"Debt/Equity of {de:.2f}, conservative balance sheet"))
+
+    # Liquidity risk
+    cr = info.get("currentRatio", 0) or 0
+    if cr < 1.0:
+        risks.append(("Liquidity Risk", "High",
+                      f"Current ratio of {cr:.2f} below 1.0"))
+    elif cr < 1.5:
+        risks.append(("Liquidity Risk", "Medium",
+                      f"Current ratio of {cr:.2f}, adequate but watch"))
+    else:
+        risks.append(("Liquidity Risk", "Low",
+                      f"Current ratio of {cr:.2f}, strong liquidity"))
+
+    # Concentration risk
+    inst_pct = info.get("heldPercentInstitutions", 0) or 0
+    if inst_pct > 0.90:
+        risks.append(("Ownership Concentration", "Medium",
+                      f"{inst_pct:.0%} institutional ownership — crowded"))
+    else:
+        risks.append(("Ownership Concentration", "Low",
+                      f"{inst_pct:.0%} institutional ownership"))
+
+    # Growth risk
+    rev_growth = info.get("revenueGrowth", 0) or 0
+    if rev_growth < 0:
+        risks.append(("Growth Risk", "High",
+                      f"Revenue declining at {rev_growth:.1%}"))
+    elif rev_growth < 0.05:
+        risks.append(("Growth Risk", "Medium",
+                      f"Slow revenue growth of {rev_growth:.1%}"))
+    else:
+        risks.append(("Growth Risk", "Low",
+                      f"Healthy revenue growth of {rev_growth:.1%}"))
+
+    high_fill = PatternFill(start_color=cfg.COLOR_SCHEME["bad_bg"],
+                            end_color=cfg.COLOR_SCHEME["bad_bg"], fill_type="solid")
+    med_fill = PatternFill(start_color=cfg.COLOR_SCHEME["warn_bg"],
+                           end_color=cfg.COLOR_SCHEME["warn_bg"], fill_type="solid")
+    low_fill = PatternFill(start_color=cfg.COLOR_SCHEME["good_bg"],
+                           end_color=cfg.COLOR_SCHEME["good_bg"], fill_type="solid")
+
+    for i, (factor, level, detail) in enumerate(risks):
+        r = row + 1 + i
+        ws_risk.cell(row=r, column=1, value=factor)
+        level_cell = ws_risk.cell(row=r, column=2, value=level)
+        ws_risk.cell(row=r, column=3, value=detail)
+        fill_map = {"High": high_fill, "Medium": med_fill, "Low": low_fill}
+        for c in range(1, 4):
+            ws_risk.cell(row=r, column=c).fill = fill_map.get(level, alt_fill)
+
+    ws_risk.column_dimensions["A"].width = 24
+    ws_risk.column_dimensions["B"].width = 12
+    ws_risk.column_dimensions["C"].width = 50
+
     # Save
     wb.save(filepath)
     return filepath
@@ -1563,45 +2484,77 @@ def generate_excel_report(ticker: str, data: dict, results: list,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def print_console_summary(ticker: str, data: dict, results: list,
-                          composite: dict):
+                          composite: dict, quality_data: dict = None,
+                          scenario_data: dict = None):
     """Print a concise summary to the console."""
     info = data.get("info", {})
     current_price = info.get("currentPrice") or info.get("regularMarketPrice", 0)
     fair_value = composite["composite_fair_value"]
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print(f"  {ticker} — {info.get('shortName', ticker)}")
     print(f"  {info.get('sector', '')} | {info.get('industry', '')}")
-    print("=" * 60)
-    print(f"  Current Price:        ${current_price:>10,.2f}")
-    print(f"  Composite Fair Value: ${fair_value:>10,.2f}")
+    print("=" * 70)
+    print(f"  Current Price:          ${current_price:>10,.2f}")
+    print(f"  Composite Fair Value:   ${fair_value:>10,.2f}")
 
     if current_price > 0:
         pct = (fair_value - current_price) / current_price
         direction = "Upside" if pct >= 0 else "Downside"
-        print(f"  {direction}:               {pct:>10.1%}")
+        print(f"  {direction}:                 {pct:>10.1%}")
 
-    print("-" * 60)
-    print("  Method Breakdown:")
+    # Margin of safety
+    mos = cfg.MARGIN_OF_SAFETY
+    buy_below = fair_value * (1 - mos)
+    print(f"  Buy Below (w/ {mos:.0%} MoS): ${buy_below:>10,.2f}")
+
+    print("-" * 70)
+    print("  Valuation Method Breakdown:")
     for method, bd in composite["breakdown"].items():
         fv = bd["fair_value"]
         conf = bd["confidence"]
         note = bd.get("note", "")
+        wt = bd.get("weight", 0)
         if fv > 0:
-            print(f"    {method:<20s}  ${fv:>10,.2f}  (conf: {conf:.0%})")
+            print(f"    {method:<20s}  ${fv:>10,.2f}  (conf: {conf:.0%}, wt: {wt:.0%})")
         else:
             print(f"    {method:<20s}  {'N/A':>11s}  — {note}")
 
-    print("-" * 60)
+    # Quality Score
+    if quality_data:
+        print("-" * 70)
+        print(f"  Quality Score:  {quality_data['composite']}/100  "
+              f"(Grade: {quality_data['grade']})")
+        scores = quality_data.get("scores", {})
+        for dim, score in scores.items():
+            print(f"    {dim.replace('_', ' ').title():<24s}  {score:>3d}/100")
+
+    # Scenario Analysis
+    if scenario_data and scenario_data.get("base", 0) > 0:
+        print("-" * 70)
+        print("  Scenario Analysis:")
+        print(f"    Bear Case:   ${scenario_data['bear']:>10,.2f}  "
+              f"({scenario_data.get('bear_upside', 0):>+.1%})")
+        print(f"    Base Case:   ${scenario_data['base']:>10,.2f}  "
+              f"({scenario_data.get('base_upside', 0):>+.1%})")
+        print(f"    Bull Case:   ${scenario_data['bull']:>10,.2f}  "
+              f"({scenario_data.get('bull_upside', 0):>+.1%})")
+        print(f"    Weighted:    ${scenario_data['weighted']:>10,.2f}")
+
+    print("-" * 70)
     if current_price > 0:
         pct = (fair_value - current_price) / current_price
-        if pct > 0.15:
-            print("  >> UNDERVALUED — Consider Buying")
-        elif pct < -0.15:
-            print("  >> OVERVALUED — Consider Selling")
+        if pct > 0.20:
+            print("  >> STRONG BUY — Significantly undervalued")
+        elif pct > 0.10:
+            print("  >> BUY — Undervalued with margin of safety")
+        elif pct > -0.10:
+            print("  >> HOLD — Fairly valued")
+        elif pct > -0.20:
+            print("  >> SELL — Appears overvalued")
         else:
-            print("  >> FAIRLY VALUED — Hold")
-    print("=" * 60 + "\n")
+            print("  >> STRONG SELL — Significantly overvalued")
+    print("=" * 70 + "\n")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1616,46 +2569,58 @@ def analyze_stock(ticker: str) -> str:
     print(f"{'━' * 60}")
 
     # Step 1: Fetch data
-    print("\n[1/7] Fetching market data...")
+    print("\n[ 1/11] Fetching market data...")
     data = fetch_yfinance_data(ticker)
 
     if not data.get("info"):
         print(f"  ERROR: Could not retrieve data for {ticker}. Skipping.")
         return ""
 
-    # Step 2: Run valuation models
-    print("[2/7] Running DCF valuation...")
+    # Step 2-8: Run valuation models
+    print("[ 2/11] Running DCF valuation...")
     dcf = dcf_valuation(data)
 
-    print("[3/7] Running comparable companies analysis...")
+    print("[ 3/11] Running comparable companies analysis...")
     comps = comps_valuation(data, ticker)
 
-    print("[4/7] Gathering analyst price targets...")
+    print("[ 4/11] Gathering analyst price targets...")
     analyst = analyst_valuation(data)
 
-    print("[5/7] Running technical analysis...")
+    print("[ 5/11] Running technical analysis...")
     tech = technical_valuation(data)
 
-    print("[6/7] Analyzing sentiment...")
+    print("[ 6/11] Analyzing sentiment...")
     sent = sentiment_valuation(data, ticker)
 
-    print("[7/7] Analyzing seasonal patterns...")
+    print("[ 7/11] Analyzing seasonal patterns...")
     seas = seasonal_valuation(data)
 
-    results = [dcf, comps, analyst, tech, sent, seas]
+    print("[ 8/11] Running Historical P/E valuation...")
+    hist_pe = historical_pe_valuation(data)
 
-    # Composite
+    results = [dcf, comps, analyst, tech, sent, seas, hist_pe]
+
+    # Step 9: Composite (only uses DCF, Comps, Historical P/E for fair value)
     composite = composite_valuation(results, cfg.VALUATION_WEIGHTS)
+
+    # Quality & Scenario
+    print("[ 9/11] Computing quality score...")
+    quality_data = quality_score_analysis(data)
+
+    print("[10/11] Running scenario analysis...")
+    scenario_data = scenario_analysis(data, results)
 
     # Macro
     macro = fetch_macro_environment()
 
     # Console output
-    print_console_summary(ticker, data, results, composite)
+    print_console_summary(ticker, data, results, composite,
+                          quality_data, scenario_data)
 
     # Excel report
-    print("Generating Excel report...")
-    filepath = generate_excel_report(ticker, data, results, composite, macro)
+    print("[11/11] Generating Excel report (20 sheets)...")
+    filepath = generate_excel_report(ticker, data, results, composite, macro,
+                                     quality_data, scenario_data)
     print(f"  Report saved to: {filepath}")
 
     return filepath
